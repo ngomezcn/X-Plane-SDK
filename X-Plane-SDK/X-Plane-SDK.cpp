@@ -1,437 +1,380 @@
-// Downloaded from https://developer.x-plane.com/code-sample/crash-handling/
+#include "XPLMDisplay.h"
+#include "XPLMGraphics.h"
+#include "XPLMProcessing.h"
 #include "XPLMDataAccess.h"
 #include "XPLMMenus.h"
-#include "XPLMProcessing.h"
-#include "XPLMPlugin.h"
-
-// This option enables support for multi threaded crash handling.
-// It requires C++11 or newer
-#define SUPPORT_BACKGROUND_THREADS 0
-
-#include <cstring>
-#include <cstdlib>
-
-#if SUPPORT_BACKGROUND_THREADS
-#include <atomic>
-#include <set>
-#include <thread>
-#include <mutex>
+#include "XPLMUtilities.h"
+#include "XPWidgets.h"
+#include "XPStandardWidgets.h"
+#include "XPLMCamera.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#if IBM
+#include <windows.h>
 #endif
 
-#if APL || LIN
-#include <signal.h>
-#include <execinfo.h>
-#include <fcntl.h>
-#include <unistd.h>
-#endif
+#define MAX_ITEMS 11
 
+static XPLMDataRef gPositionDataRef[MAX_ITEMS];
+
+static char DataRefString[MAX_ITEMS][255] = { "sim/flightmodel/position/local_x", "sim/flightmodel/position/local_y", "sim/flightmodel/position/local_z",
+										"sim/flightmodel/position/lat_ref", "sim/flightmodel/position/lon_ref",	"sim/flightmodel/position/theta",
+										"sim/flightmodel/position/phi", "sim/flightmodel/position/psi",
+										"sim/flightmodel/position/latitude", "sim/flightmodel/position/longitude", "sim/flightmodel/position/elevation" };
+
+static char DataRefDesc[MAX_ITEMS][255] = { "Local x", "Local y", "Local z", "Lat Ref", "Lon Ref", "Theta", "Phi", "Psi" };
+static char Description[3][255] = { "Latitude", "Longitude", "Elevation" };
+
+static int	Element = 0, IntVals[128];
+static float FloatVals[128];
+static int ByteVals[128];
+
+static int MenuItem1;
+
+static XPWidgetID			PositionWidget = NULL, PositionWindow = NULL;
+static XPWidgetID			PositionApplyButton = NULL;
+static XPWidgetID			PositionText[MAX_ITEMS] = { NULL };
+static XPWidgetID			PositionEdit[MAX_ITEMS] = { NULL };
+static XPWidgetID			UpArrow[MAX_ITEMS] = { NULL };
+static XPWidgetID			DownArrow[MAX_ITEMS] = { NULL };
+static XPWidgetID			LatLonAltApplyButton = NULL, LatLonRefApplyButton = NULL, ReloadSceneryButton = NULL;
+static XPWidgetID			Position2Text[3] = { NULL };
+static XPWidgetID			Position2Edit[3] = { NULL };
+
+static void PositionMenuHandler(void*, void*);
+
+static void CreatePosition(int x1, int y1, int w, int h);
+
+static int PositionHandler(
+	XPWidgetMessage			inMessage,
+	XPWidgetID				inWidget,
+	intptr_t				inParam1,
+	intptr_t				inParam2);
+
+static void DisplayFindDataRef(void);
+static void ApplyValues(void);
+static void ApplyLatLonRefValues(void);
+static void ApplyLatLonAltValues(void);
+
+inline	float	HACKFLOAT(float val)
+{
+	return val;
+}
 /*
- * This plugin demonstrates how to intercept and handle crashes in a way that plays nicely with the X-Plane crash reporter.
- * The core idea is to intercept all crashes by installing appropriate crash handlers and then filtering out crashes that weren't caused
- * by our plugin. To do so, we track both the threads created by us at runtime, as well as checking whether our plugin is active when we crash on the main thread.
- * If the crash wasn't caused by us, the crash is forwarded to the next crash handler (potentially X-Plane, or another plugin) which then gets a chance
- * to process the crash.
- * If the crash is caused by us, we eat the crash to not falsely trigger X-Planes crash reporter and pollute the X-Plane crash database. This example
- * also writes a minidump file on Windows and a simple backtrace on macOS and Linux. Production code might want to integrate more sophisticated crash handling
- */
-
-#if SUPPORT_BACKGROUND_THREADS
-static std::thread::id s_main_thread;
-static std::atomic_flag s_thread_lock;
-static std::set<std::thread::id> s_known_threads;
-#endif
-
-static XPLMPluginID s_my_plugin_id;
-
-// Function called when we detect a crash that was caused by us
-void handle_crash(void* context);
-
-#if APL || LIN
-static struct sigaction s_prev_sigsegv = {};
-static struct sigaction s_prev_sigabrt = {};
-static struct sigaction s_prev_sigfpe = {};
-static struct sigaction s_prev_sigint = {};
-static struct sigaction s_prev_sigill = {};
-static struct sigaction s_prev_sigterm = {};
-
-static void handle_posix_sig(int sig, siginfo_t* siginfo, void* context);
-#endif
-
 #if IBM
-static LPTOP_LEVEL_EXCEPTION_FILTER s_previous_windows_exception_handler;
-LONG WINAPI handle_windows_exception(EXCEPTION_POINTERS* ei);
-#endif
-
-#if SUPPORT_BACKGROUND_THREADS
-// Registers the calling thread with the crash handler. We use this to figure out if a crashed thread belongs to us when we later try to figure out if we caused a crash
-void register_thread_for_crash_handler()
+inline	float	HACKFLOAT(float val)
 {
-	while (s_thread_lock.test_and_set(std::memory_order_acquire))
-	{
-	}
-
-	s_known_threads.insert(std::this_thread::get_id());
-
-	s_thread_lock.clear(std::memory_order_release);
+	return val;
 }
-
-// Unregisters the calling thread from the crash handler. MUST be called at the end of thread that was registered via register_thread_for_crash_handler()
-void unregister_thread_from_crash_handler()
-{
-	while (s_thread_lock.test_and_set(std::memory_order_acquire))
-	{
-	}
-
-	s_known_threads.erase(std::this_thread::get_id());
-
-	s_thread_lock.clear(std::memory_order_release);
-}
-#endif
-
-// Registers the global crash handler. Should be called from XPluginStart
-void register_crash_handler()
-{
-#if SUPPORT_BACKGROUND_THREADS
-	s_main_thread = std::this_thread::get_id();
-#endif
-	s_my_plugin_id = XPLMGetMyID();
-
-#if APL || LIN
-	struct sigaction sig_action = { .sa_sigaction = handle_posix_sig };
-
-	sigemptyset(&sig_action.sa_mask);
-
-#if	LIN
-	static uint8_t alternate_stack[SIGSTKSZ];
-	stack_t ss = {
-		.ss_sp = (void*)alternate_stack,
-		.ss_size = SIGSTKSZ,
-		.ss_flags = 0
-	};
-
-	sigaltstack(&ss, NULL);
-	sig_action.sa_flags = SA_SIGINFO | SA_ONSTACK;
 #else
-	sig_action.sa_flags = SA_SIGINFO;
-#endif
-
-	sigaction(SIGSEGV, &sig_action, &s_prev_sigsegv);
-	sigaction(SIGABRT, &sig_action, &s_prev_sigabrt);
-	sigaction(SIGFPE, &sig_action, &s_prev_sigfpe);
-	sigaction(SIGINT, &sig_action, &s_prev_sigint);
-	sigaction(SIGILL, &sig_action, &s_prev_sigill);
-	sigaction(SIGTERM, &sig_action, &s_prev_sigterm);
-#endif
-
-#if IBM
-	// Load the debug helper library into the process already, this way we don't have to hit the dynamic loader
-	// in an exception context where it's potentially unsafe to do so.
-	HMODULE module = ::GetModuleHandleA("dbghelp.dll");
-	if (!module)
-		module = ::LoadLibraryA("dbghelp.dll");
-
-	(void)module;
-	s_previous_windows_exception_handler = SetUnhandledExceptionFilter(handle_windows_exception);
-#endif
-}
-
-// Unregisters the global crash handler. You need to call this in XPluginStop so we can clean up after ourselves
-void unregister_crash_handler()
+inline long long HACKFLOAT(float val)
 {
-#if APL || LIN
-	sigaction(SIGSEGV, &s_prev_sigsegv, NULL);
-	sigaction(SIGABRT, &s_prev_sigabrt, NULL);
-	sigaction(SIGFPE, &s_prev_sigfpe, NULL);
-	sigaction(SIGINT, &s_prev_sigint, NULL);
-	sigaction(SIGILL, &s_prev_sigill, NULL);
-	sigaction(SIGTERM, &s_prev_sigterm, NULL);
-#endif
-
-#if IBM
-	SetUnhandledExceptionFilter(s_previous_windows_exception_handler);
-#endif
-}
-
-#if SUPPORT_BACKGROUND_THREADS
-// A RAII helper class to register and unregister threads to participate in crash detection
-class StThreadCrashCookie
-{
-public:
-	StThreadCrashCookie()
-	{
-		register_thread_for_crash_handler();
-	}
-	~StThreadCrashCookie()
-	{
-		unregister_thread_from_crash_handler();
-	}
-};
-#endif
-
-
-// Predicates that returns true if a thread is caused by us
-// The main idea is to check the plugin ID if we are on the main thread,
-// if not, we check if the current thread is known to be from us.
-// Returns false if the crash was caused by code that didn't come from our plugin
-bool is_us_executing()
-{
-#if SUPPORT_BACKGROUND_THREADS
-	const std::thread::id thread_id = std::this_thread::get_id();
-
-	if (thread_id == s_main_thread)
-	{
-		// Check if the plugin executing is our plugin.
-		// XPLMGetMyID() will return the ID of the currently executing plugin. If this is us, then it will return the plugin ID that we have previously stashed away
-		return (s_my_plugin_id == XPLMGetMyID());
-	}
-
-	if (s_thread_lock.test_and_set(std::memory_order_acquire))
-	{
-		// We couldn't acquire our lock. In this case it's better if we just say it's not us so we don't eat the exception
-		return false;
-	}
-
-	const bool is_our_thread = (s_known_threads.find(thread_id) != s_known_threads.end());
-	s_thread_lock.clear(std::memory_order_release);
-
-	return is_our_thread;
-#else
-	return (s_my_plugin_id == XPLMGetMyID());
-#endif
-}
-
-#if	APL || LIN
-
-static void handle_posix_sig(int sig, siginfo_t* siginfo, void* context)
-{
-	if (is_us_executing())
-	{
-		static bool has_called_out = false;
-
-		if (!has_called_out)
-		{
-			has_called_out = true;
-			handle_crash((void*)sig);
-		}
-
-		abort();
-	}
-
-	// Forward the signal to the other handlers
-#define	FORWARD_SIGNAL(sigact) \
-	do { \
-		if((sigact)->sa_sigaction && ((sigact)->sa_flags & SA_SIGINFO)) \
-			(sigact)->sa_sigaction(sig, siginfo, context); \
-		else if((sigact)->sa_handler) \
-			(sigact)->sa_handler(sig); \
-	} while (0)
-
-	switch (sig)
-	{
-	case SIGSEGV:
-		FORWARD_SIGNAL(&s_prev_sigsegv);
-		break;
-	case SIGABRT:
-		FORWARD_SIGNAL(&s_prev_sigabrt);
-		break;
-	case SIGFPE:
-		FORWARD_SIGNAL(&s_prev_sigfpe);
-		break;
-	case SIGILL:
-		FORWARD_SIGNAL(&s_prev_sigill);
-		break;
-	case SIGTERM:
-		FORWARD_SIGNAL(&s_prev_sigterm);
-		break;
-	}
-
-#undef FORWARD_SIGNAL
-
-	abort();
-}
-
-#endif
-
-#if IBM
-LONG WINAPI handle_windows_exception(EXCEPTION_POINTERS* ei)
-{
-	if (is_us_executing())
-	{
-		handle_crash(ei);
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
-
-	if (s_previous_windows_exception_handler)
-		return s_previous_windows_exception_handler(ei);
-
-	return EXCEPTION_CONTINUE_SEARCH;
+	double	d = val;
+	long long temp;
+	temp = *((long long *) &d);
+	return temp;
 }
 #endif
+*/
 
-// Runtime
-#if IBM
-void write_mini_dump(PEXCEPTION_POINTERS exception_pointers);
-#endif
-
-void handle_crash(void* context)
+PLUGIN_API int XPluginStart(
+	char* outName,
+	char* outSig,
+	char* outDesc)
 {
-#if APL || LIN
-	// NOTE: This is definitely NOT production code
-	// backtrace and backtrace_symbols are NOT signal handler safe and are just put in here for demonstration purposes
-	// A better alternative would be to use something like libunwind here
+	XPLMMenuID	id;
+	int			item;
 
-	void* frames[64];
-	int frame_count = backtrace(frames, 64);
-	char** names = backtrace_symbols(frames, frame_count);
+	strcpy(outName, "Position");
+	strcpy(outSig, "xpsdk.examples.position");
+	strcpy(outDesc, "A plug-in that allows positioning of lat/lon etc.");
 
-	const int fd = open("backtrace.txt", O_CREAT | O_RDWR | O_TRUNC | O_SYNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-	if (fd >= 0)
-	{
-		for (int i = 0; i < frame_count; ++i)
-		{
-			write(fd, names[i], strlen(names[i]));
-			write(fd, "\n", 1);
-		}
+	item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Position", NULL, 1);
 
-		close(fd);
-	}
+	id = XPLMCreateMenu("Position", XPLMFindPluginsMenu(), item, PositionMenuHandler, NULL);
+	XPLMAppendMenuItem(id, "Position", (void*)"Position", 1);
 
-#endif
-#if IBM
-	// Create a mini-dump file that can be later opened up in Visual Studio or WinDbg to do post mortem debugging
-	write_mini_dump((PEXCEPTION_POINTERS)context);
-#endif
-}
+	MenuItem1 = 0;
 
-#if IBM
-#include <DbgHelp.h>
-
-typedef BOOL(WINAPI* MINIDUMPWRITEDUMP)(HANDLE hProcess, DWORD dwPid, HANDLE hFile,
-	MINIDUMP_TYPE DumpType,
-	CONST PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
-	CONST PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
-	CONST PMINIDUMP_CALLBACK_INFORMATION CallbackParam);
-
-void write_mini_dump(PEXCEPTION_POINTERS exception_pointers)
-{
-	HMODULE module = ::GetModuleHandleA("dbghelp.dll");
-	if (!module)
-		module = ::LoadLibraryA("dbghelp.dll");
-
-	if (module)
-	{
-		const MINIDUMPWRITEDUMP pDump = MINIDUMPWRITEDUMP(::GetProcAddress(module, "MiniDumpWriteDump"));
-
-		if (pDump)
-		{
-			// Create dump file
-			const HANDLE handle = ::CreateFileA("crash_dump.dmp", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-
-			if (handle != INVALID_HANDLE_VALUE)
-			{
-				MINIDUMP_EXCEPTION_INFORMATION exception_information = {};
-				exception_information.ThreadId = ::GetCurrentThreadId();
-				exception_information.ExceptionPointers = exception_pointers;
-				exception_information.ClientPointers = false;
-
-				pDump(GetCurrentProcess(), GetCurrentProcessId(), handle, MiniDumpNormal, &exception_information, nullptr, nullptr);
-				::CloseHandle(handle);
-			}
-		}
-	}
-}
-#endif
-
-#if SUPPORT_BACKGROUND_THREADS
-static std::thread s_background_thread;
-static std::atomic<bool> s_background_thread_shutdown(false);
-static std::atomic<bool> s_background_thread_want_crash(false);
-
-void background_thread_func()
-{
-	StThreadCrashCookie thread_cookie; // Make sure our thread is registered with the crash handling system
-
-	while (!s_background_thread_shutdown.load(std::memory_order_acquire))
-	{
-		if (s_background_thread_want_crash.load(std::memory_order_acquire))
-		{
-			s_background_thread_want_crash = false;
-
-			int* death_is_a_destination = NULL;
-			*death_is_a_destination = 1;
-		}
-
-		std::this_thread::sleep_for(std::chrono::milliseconds(500));
-	}
-}
-#endif
-
-// User Interface
-#define MENU_ITEM_CRASH_MAIN_THREAD (void *)0x1
-#define MENU_ITEM_CRASH_BACKGROUND_THREAD (void *)0x2
-
-void menu_handler(void* inMenuRef, void* inItemRef)
-{
-	if (inItemRef == MENU_ITEM_CRASH_MAIN_THREAD)
-	{
-		int* death_is_a_destination = NULL;
-		*death_is_a_destination = 1;
-	}
-#if SUPPORT_BACKGROUND_THREADS
-	else if (inItemRef == MENU_ITEM_CRASH_BACKGROUND_THREAD)
-	{
-		s_background_thread_want_crash = true;
-	}
-#endif
-}
-
-// Plugin functions
-
-PLUGIN_API int XPluginStart(char* name, char* sig, char* desc)
-{
-	strcpy(name, "Crash Handling example");
-	strcpy(sig, "com.laminarresearch.example.crash-handling");
-	strcpy(desc, "Example plugin for crash handling");
-
-	register_crash_handler();
-
-#if SUPPORT_BACKGROUND_THREADS
-	s_background_thread = std::thread(&background_thread_func);
-#endif
-
-	const int plugin_menu_item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Crash Handler", NULL, 0);
-	const XPLMMenuID menu = XPLMCreateMenu("Crash Handler", XPLMFindPluginsMenu(), plugin_menu_item, menu_handler, NULL);
-
-	XPLMAppendMenuItem(menu, "Crash main thread", MENU_ITEM_CRASH_MAIN_THREAD, 0);
-#if SUPPORT_BACKGROUND_THREADS
-	XPLMAppendMenuItem(menu, "Crash background thread", MENU_ITEM_CRASH_BACKGROUND_THREAD, 0);
-#endif
+	for (int Item = 0; Item < MAX_ITEMS; Item++)
+		gPositionDataRef[Item] = XPLMFindDataRef(DataRefString[Item]);
 
 	return 1;
 }
 
-PLUGIN_API void XPluginStop(void)
+PLUGIN_API void	XPluginStop(void)
 {
-#if SUPPORT_BACKGROUND_THREADS
-	// Tell the background thread to shutdown and then wait for it
-	s_background_thread_shutdown.store(true, std::memory_order_release);
-	s_background_thread.join();
-#endif
-
-	unregister_crash_handler();
-}
-
-
-PLUGIN_API int XPluginEnable(void)
-{
-	return 1;
+	if (MenuItem1 == 1)
+	{
+		XPDestroyWidget(PositionWidget, 1);
+		MenuItem1 = 0;
+	}
 }
 
 PLUGIN_API void XPluginDisable(void)
 {
 }
 
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID from, int msg, void* param)
-{}
+PLUGIN_API int XPluginEnable(void)
+{
+	return 1;
+}
+
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFrom, int inMsg, void* inParam)
+{
+}
+
+void PositionMenuHandler(void* mRef, void* iRef)
+{
+	if (!strcmp((char*)iRef, "Position"))
+	{
+		if (MenuItem1 == 0)
+		{
+			CreatePosition(300, 600, 300, 550);
+			MenuItem1 = 1;
+		}
+		else
+			if (!XPIsWidgetVisible(PositionWidget))
+				XPShowWidget(PositionWidget);
+	}
+}
 
 
+void CreatePosition(int x, int y, int w, int h)
+{
+	int x2 = x + w;
+	int y2 = y - h;
+	float FloatValue[MAX_ITEMS];
+	double DoubleValue[3];
+
+	char buffer[512];
+	int Item;
+
+	for (Item = 0; Item < MAX_ITEMS; Item++)
+		FloatValue[Item] = XPLMGetDataf(gPositionDataRef[Item]);
+
+	/// X, Y, Z, Lat, Lon, Alt
+	XPLMLocalToWorld(FloatValue[0], FloatValue[1], FloatValue[2], &DoubleValue[0], &DoubleValue[1], &DoubleValue[2]);
+	DoubleValue[2] *= 3.28;
+
+	PositionWidget = XPCreateWidget(x, y, x2, y2,
+		1,	// Visible
+		"Position",	// desc
+		1,		// root
+		NULL,	// no container
+		xpWidgetClass_MainWindow);
+
+	XPSetWidgetProperty(PositionWidget, xpProperty_MainWindowHasCloseBoxes, 1);
+
+	PositionWindow = XPCreateWidget(x + 50, y - 50, x2 - 50, y2 + 50,
+		1,	// Visible
+		"",	// desc
+		0,		// root
+		PositionWidget,
+		xpWidgetClass_SubWindow);
+
+	XPSetWidgetProperty(PositionWindow, xpProperty_SubWindowType, xpSubWindowStyle_SubWindow);
+
+	for (Item = 0; Item < MAX_ITEMS - 3; Item++)
+	{
+		PositionText[Item] = XPCreateWidget(x + 60, y - (70 + (Item * 30)), x + 115, y - (92 + (Item * 30)),
+			1,	// Visible
+			DataRefDesc[Item],// desc
+			0,		// root
+			PositionWidget,
+			xpWidgetClass_Caption);
+
+		sprintf(buffer, "%f", HACKFLOAT(FloatValue[Item]));
+		PositionEdit[Item] = XPCreateWidget(x + 120, y - (70 + (Item * 30)), x + 210, y - (92 + (Item * 30)),
+			1, buffer, 0, PositionWidget,
+			xpWidgetClass_TextField);
+
+		XPSetWidgetProperty(PositionEdit[Item], xpProperty_TextFieldType, xpTextEntryField);
+
+		UpArrow[Item] = XPCreateWidget(x + 212, y - (66 + (Item * 30)), x + 224, y - (81 + (Item * 30)),
+			1, "", 0, PositionWidget,
+			xpWidgetClass_Button);
+
+		XPSetWidgetProperty(UpArrow[Item], xpProperty_ButtonType, xpLittleUpArrow);
+
+		DownArrow[Item] = XPCreateWidget(x + 212, y - (81 + (Item * 30)), x + 224, y - (96 + (Item * 30)),
+			1, "", 0, PositionWidget,
+			xpWidgetClass_Button);
+
+		XPSetWidgetProperty(DownArrow[Item], xpProperty_ButtonType, xpLittleDownArrow);
+	}
+
+	PositionApplyButton = XPCreateWidget(x + 50, y - 310, x + 140, y - 332,
+		1, "Apply Data", 0, PositionWidget,
+		xpWidgetClass_Button);
+
+	XPSetWidgetProperty(PositionApplyButton, xpProperty_ButtonType, xpPushButton);
+
+
+	LatLonRefApplyButton = XPCreateWidget(x + 145, y - 310, x + 240, y - 332,
+		1, "Apply LatLonRef", 0, PositionWidget,
+		xpWidgetClass_Button);
+
+	XPSetWidgetProperty(LatLonRefApplyButton, xpProperty_ButtonType, xpPushButton);
+
+
+	for (Item = 0; Item < 3; Item++)
+	{
+		Position2Text[Item] = XPCreateWidget(x + 60, y - (350 + (Item * 30)), x + 115, y - (372 + (Item * 30)),
+			1,	// Visible
+			Description[Item],// desc
+			0,		// root
+			PositionWidget,
+			xpWidgetClass_Caption);
+
+		sprintf(buffer, "%lf", HACKFLOAT(DoubleValue[Item]));
+		Position2Edit[Item] = XPCreateWidget(x + 120, y - (350 + (Item * 30)), x + 210, y - (372 + (Item * 30)),
+			1, buffer, 0, PositionWidget,
+			xpWidgetClass_TextField);
+
+		XPSetWidgetProperty(PositionEdit[Item], xpProperty_TextFieldType, xpTextEntryField);
+	}
+
+	LatLonAltApplyButton = XPCreateWidget(x + 70, y - 440, x + 220, y - 462,
+		1, "Apply LatLonAlt", 0, PositionWidget,
+		xpWidgetClass_Button);
+
+	XPSetWidgetProperty(LatLonAltApplyButton, xpProperty_ButtonType, xpPushButton);
+
+	ReloadSceneryButton = XPCreateWidget(x + 70, y - 465, x + 220, y - 487,
+		1, "Reload Scenery", 0, PositionWidget,
+		xpWidgetClass_Button);
+
+	XPSetWidgetProperty(ReloadSceneryButton, xpProperty_ButtonType, xpPushButton);
+
+	XPAddWidgetCallback(PositionWidget, PositionHandler);
+}
+
+int	PositionHandler(
+	XPWidgetMessage			inMessage,
+	XPWidgetID				inWidget,
+	intptr_t				inParam1,
+	intptr_t				inParam2)
+{
+	float FloatValue[MAX_ITEMS];
+	char buffer[512];
+	int Item;
+
+	for (Item = 0; Item < MAX_ITEMS; Item++)
+		FloatValue[Item] = XPLMGetDataf(gPositionDataRef[Item]);
+
+	if (inMessage == xpMessage_CloseButtonPushed)
+	{
+		if (MenuItem1 == 1)
+		{
+			XPHideWidget(PositionWidget);
+		}
+		return 1;
+	}
+
+	if (inMessage == xpMsg_PushButtonPressed)
+	{
+		if (inParam1 == (intptr_t)PositionApplyButton)
+		{
+			ApplyValues();
+			return 1;
+		}
+
+		if (inParam1 == (intptr_t)LatLonRefApplyButton)
+		{
+			ApplyLatLonRefValues();
+			return 1;
+		}
+
+		if (inParam1 == (intptr_t)LatLonAltApplyButton)
+		{
+			ApplyLatLonAltValues();
+			return 1;
+		}
+
+		if (inParam1 == (intptr_t)ReloadSceneryButton)
+		{
+			XPLMReloadScenery();
+			return 1;
+		}
+
+		for (Item = 0; Item < MAX_ITEMS - 3; Item++)
+		{
+			if (inParam1 == (intptr_t)UpArrow[Item])
+			{
+				FloatValue[Item] += 1.0;
+				sprintf(buffer, "%f", HACKFLOAT(FloatValue[Item]));
+				XPSetWidgetDescriptor(PositionEdit[Item], buffer);
+				XPLMSetDataf(gPositionDataRef[Item], FloatValue[Item]);
+				return 1;
+			}
+		}
+
+		for (Item = 0; Item < MAX_ITEMS - 3; Item++)
+		{
+			if (inParam1 == (intptr_t)DownArrow[Item])
+			{
+				FloatValue[Item] -= 1.0;
+				sprintf(buffer, "%f", HACKFLOAT(FloatValue[Item]));
+				XPSetWidgetDescriptor(PositionEdit[Item], buffer);
+				XPLMSetDataf(gPositionDataRef[Item], FloatValue[Item]);
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+void ApplyValues(void)
+{
+	char	buffer[512];
+
+	for (int Item = 0; Item < MAX_ITEMS - 3; Item++)
+	{
+		XPGetWidgetDescriptor(PositionEdit[Item], buffer, 512);
+		XPLMSetDataf(gPositionDataRef[Item], atof(buffer));
+	}
+}
+
+void ApplyLatLonRefValues(void)
+{
+	float FloatValue;
+	char	buffer[512];
+
+	XPGetWidgetDescriptor(PositionEdit[3], buffer, 512);
+	FloatValue = atof(buffer);
+	XPLMSetDataf(gPositionDataRef[3], FloatValue);
+
+	XPGetWidgetDescriptor(PositionEdit[4], buffer, 512);
+	FloatValue = atof(buffer);
+	XPLMSetDataf(gPositionDataRef[4], FloatValue);
+}
+
+void ApplyLatLonAltValues(void)
+{
+	float FloatValue[3];
+	double DoubleValue[3];
+	char	buffer[512];
+	int Item;
+
+	// This gets the lat/lon/alt from the widget text fields
+	for (Item = 0; Item < 3; Item++)
+	{
+		XPGetWidgetDescriptor(Position2Edit[Item], buffer, 512);
+		FloatValue[Item] = atof(buffer);
+	}
+
+	/// Lat, Lon, Alt, X, Y, Z
+	XPLMWorldToLocal(FloatValue[0], FloatValue[1], FloatValue[2] / 3.28, &DoubleValue[0], &DoubleValue[1], &DoubleValue[2]);
+
+	for (Item = 0; Item < 3; Item++)
+	{
+		// This writes out the lat/lon/alt from the widget text fields back to the datarefs
+		XPLMSetDataf(gPositionDataRef[Item + 8], FloatValue[Item]);
+		// This writes out the x,y,z datarefs after conversion from lat/lon/alt back to the datarefs
+		XPLMSetDataf(gPositionDataRef[Item], DoubleValue[Item]);
+	}
+
+	ApplyLatLonRefValues();
+}
