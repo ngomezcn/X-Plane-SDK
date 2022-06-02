@@ -1,3 +1,4 @@
+// Downloaded from https://developer.x-plane.com/code-sample/crash-handling/
 #include "XPLMDataAccess.h"
 #include "XPLMMenus.h"
 #include "XPLMProcessing.h"
@@ -7,12 +8,7 @@
 // It requires C++11 or newer
 #define SUPPORT_BACKGROUND_THREADS 0
 
-#pragma _CRT_SECURE_NO_WARNINGS 1
-
-#include <Windows.h>
-
 #include <cstring>
-#include <iostream>
 #include <cstdlib>
 
 #if SUPPORT_BACKGROUND_THREADS
@@ -393,13 +389,9 @@ void menu_handler(void* inMenuRef, void* inItemRef)
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc)
 {
-	std::string sname = "Crash Handling example";
-	std::string ssig = "com.laminarresearch.example.crash-handling";
-	std::string sdesc = "Example plugin for crash handling";
-	
-	strcpy_s(name, sname.size() + 1, sname.c_str());
-	strcpy_s(sig, ssig.size() + 1, ssig.c_str());
-	strcpy_s(desc, sdesc.size()+1, sdesc.c_str());
+	strcpy(name, "Crash Handling example");
+	strcpy(sig, "com.laminarresearch.example.crash-handling");
+	strcpy(desc, "Example plugin for crash handling");
 
 	register_crash_handler();
 
@@ -441,3 +433,5 @@ PLUGIN_API void XPluginDisable(void)
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID from, int msg, void* param)
 {}
+
+
