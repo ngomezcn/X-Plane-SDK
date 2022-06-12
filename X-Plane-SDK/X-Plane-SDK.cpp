@@ -11,7 +11,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #if IBM
+#include <Windows.h>
+#include <vector>
+#include <TlHelp32.h>
+#include <tchar.h>
+#include <sstream>
 #include <windows.h>
+#include <TlHelp32.h>
+#include <iostream>
+#include <sstream>
+#include <string.h> 
 #endif
 
 #define MAX_ITEMS 11
@@ -78,6 +87,8 @@ inline long long HACKFLOAT(float val)
 #endif
 */
 
+#define true 1
+
 PLUGIN_API int XPluginStart(
 	char* outName,
 	char* outSig,
@@ -86,14 +97,16 @@ PLUGIN_API int XPluginStart(
 	XPLMMenuID	id;
 	int			item;
 
-	strcpy(outName, "Position");
-	strcpy(outSig, "xpsdk.examples.position");
+	strcpy(outName, "Positionv2");
+	strcpy(outSig, "xpsdk.examples.Positionv2");
 	strcpy(outDesc, "A plug-in that allows positioning of lat/lon etc.");
 
 	item = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Position", NULL, 1);
+	XPLMDebugString("Loading X-Plane SDK Connect\n");
 
 	id = XPLMCreateMenu("Position", XPLMFindPluginsMenu(), item, PositionMenuHandler, NULL);
-	XPLMAppendMenuItem(id, "Position", (void*)"Position", 1);
+	XPLMAppendMenuItem(id, "Position2", (void*)"Position", 1);
+	XPLMAppendMenuItem(id, "Stop2", (void*)"Stop", 1);
 
 	MenuItem1 = 0;
 
@@ -127,8 +140,10 @@ PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFrom, int inMsg, void* inPa
 
 void PositionMenuHandler(void* mRef, void* iRef)
 {
+
 	if (!strcmp((char*)iRef, "Position"))
 	{
+
 		if (MenuItem1 == 0)
 		{
 			CreatePosition(300, 600, 300, 550);
@@ -137,6 +152,11 @@ void PositionMenuHandler(void* mRef, void* iRef)
 		else
 			if (!XPIsWidgetVisible(PositionWidget))
 				XPShowWidget(PositionWidget);
+	}
+	if (!strcmp((char*)iRef, "Stop"))
+	{
+		XPluginDisable();
+		XPluginStop();
 	}
 }
 
